@@ -1,0 +1,671 @@
+diff --git a/erpnext/stock/stock_ledger.py b/erpnext/stock/stock_ledger.py
+index a1dc9d1..e6f6f80 100644
+--- a/erpnext/stock/stock_ledger.py
++++ b/erpnext/stock/stock_ledger.py
+@@ -55,6 +55,24 @@ class SerialNoExistsInFutureTransaction(frappe.ValidationError):
+ 	pass
+ 
+ 
++# Precision used to decide whether a recalculated entry matches the stored entry.
++# Same as the precision of the qty and rate columns of Stock Ledger Entry.
++VALUATION_STATE_PRECISION = 9
++
++RETURN_AND_TRANSFER_VOUCHER_TYPES = (
++	"Purchase Receipt",
++	"Purchase Invoice",
++	"Delivery Note",
++	"Sales Invoice",
++	"Subcontracting Receipt",
++)
++
++
++def is_repost_early_exit_enabled():
++	"""Early exit is on by default. Set `disable_repost_early_exit` in site config to turn it off."""
++	return not (frappe.flags.disable_repost_early_exit or frappe.conf.get("disable_repost_early_exit"))
++
++
+ def make_sl_entries(sl_entries, allow_negative_stock=False, via_landed_cost_voucher=False):
+ 	"""Create SL entries from SL entry dicts
+ 
+@@ -598,6 +616,16 @@ class update_entries_after:
+ 		self.distinct_dependant_item_wh = set()
+ 		self.prev_sle_dict = frappe._dict({})
+ 
++		# Early exit: once the recalculated valuation state of an item-warehouse matches the
++		# state already stored in the ledger, later entries of that item-warehouse would be
++		# recalculated to the same values, so they are not processed or written again.
++		self.pending_reposts = self.get_other_pending_reposts()
++		self.early_exit_enabled = is_repost_early_exit_enabled() and not self.pending_reposts
++		self.diverged_item_wh = set()
++		self.converged_item_wh = set()
++		self.reposting_stats = frappe._dict({"processed": 0, "skipped": 0})
++		self.state_trace = []
++
+ 	def get_item_wh_wise_last_posted_sle(self):
+ 		if self.args and self.args.get("item_wh_wise_last_posted_sle"):
+ 			_sles = {}
+@@ -650,7 +678,16 @@ class update_entries_after:
+ 			if item_wh_key not in self.prev_sle_dict:
+ 				self.prev_sle_dict[item_wh_key] = get_previous_sle_of_current_voucher(sle)
+ 
++			if self.can_skip_converged_sle(sle):
++				self.skip_converged_sle(sle)
++				continue
++
++			stored_state = self.get_valuation_state(sle) if self.early_exit_enabled else None
+ 			self.repost_stock_ledger_entry(sle)
++			self.reposting_stats.processed += 1
++			# repost_stock_ledger_entry() works on a copy of the row and keeps the recalculated
++			# copy in prev_sle_dict, so the new values are read from there.
++			self.update_convergence(self.prev_sle_dict.get(item_wh_key), stored_state)
+ 
+ 			# To avoid duplicate reposting of same sle in case of multiple dependant sle
+ 			self.distinct_sles.add(sle.name)
+@@ -662,6 +699,118 @@ class update_entries_after:
+ 			if i % 2000 == 0:
+ 				self.update_data_in_repost(len(self._sles), i)
+ 
++		self.record_reposting_stats()
++
++	def record_reposting_stats(self):
++		"""Tests and benchmarks set frappe.flags.repost_early_exit_stats to a list to see what a
++		repost did. Nothing is recorded otherwise."""
++		if frappe.flags.repost_early_exit_stats is None:
++			return
++
++		frappe.flags.repost_early_exit_stats.append(
++			frappe._dict(
++				{
++					"item_code": self.item_code,
++					"early_exit_enabled": self.early_exit_enabled,
++					"pending_reposts": self.pending_reposts,
++					"processed": self.reposting_stats.processed,
++					"skipped": self.reposting_stats.skipped,
++					"trace": self.state_trace,
++				}
++			)
++		)
++
++	def get_valuation_state(self, sle):
++		"""Everything the next entry of this item-warehouse depends on."""
++		stock_queue = sle.stock_queue
++		if isinstance(stock_queue, str):
++			stock_queue = json.loads(stock_queue or "[]")
++
++		return (
++			flt(sle.qty_after_transaction, VALUATION_STATE_PRECISION),
++			flt(sle.stock_value, self.currency_precision),
++			flt(sle.valuation_rate, VALUATION_STATE_PRECISION),
++			tuple(
++				(flt(qty, VALUATION_STATE_PRECISION), flt(rate, VALUATION_STATE_PRECISION))
++				for qty, rate in (stock_queue or [])
++			),
++		)
++
++	def get_other_pending_reposts(self):
++		"""After a repost, ERPNext marks later queued reposts of the same item-warehouse as
++		Skipped (deduplicate_similar_repost) because a full walk already covered them.
++		An early exit would break that assumption, so it is used only when no other repost
++		is pending. A failed repost may have left stale entries, so it also turns it off."""
++		filters = {"docstatus": 1, "status": ("in", ("Queued", "In Progress", "Failed"))}
++		if self.repost_doc:
++			filters["name"] = ("!=", self.repost_doc.name)
++
++		return frappe.get_all("Repost Item Valuation", filters=filters, pluck="name", limit=5)
++
++	def update_convergence(self, sle, stored_state):
++		key = (sle.item_code, sle.warehouse)
++		if stored_state is None or self.exceptions or self.has_serial_or_batch(sle):
++			self.converged_item_wh.discard(key)
++			return
++
++		new_state = self.get_valuation_state(sle)
++		if frappe.flags.repost_early_exit_stats is not None and len(self.state_trace) < 8:
++			self.state_trace.append((sle.voucher_type, sle.item_code, stored_state, new_state))
++
++		if stored_state != new_state:
++			# The change has reached this item-warehouse.
++			self.diverged_item_wh.add(key)
++			self.converged_item_wh.discard(key)
++		elif key in self.diverged_item_wh:
++			# The state went back to what is stored. Entries of the voucher that started the
++			# repost were written just before it, so they always match. That is why a match
++			# counts only after a difference has been seen.
++			self.converged_item_wh.add(key)
++
++	def can_skip_converged_sle(self, sle):
++		if not self.early_exit_enabled or self.args.get("sle_id"):
++			return False
++
++		if (sle.item_code, sle.warehouse) not in self.converged_item_wh:
++			return False
++
++		# An entry whose rate is taken from another transaction can change even though the
++		# state before it did not, so it is always recalculated.
++		return not self.has_dynamic_rate(sle)
++
++	def skip_converged_sle(self, sle):
++		# The stored values of this entry are already correct. Use it as the previous entry
++		# for the next one, and so that update_bin() picks the last entry of the ledger.
++		self.prev_sle_dict[(sle.item_code, sle.warehouse)] = sle
++		self.distinct_sles.add(sle.name)
++		self.update_item_wh_wise_last_posted_sle(sle)
++		self.reposting_stats.skipped += 1
++
++	def has_serial_or_batch(self, sle):
++		return bool(sle.serial_no or sle.batch_no or sle.serial_and_batch_bundle)
++
++	def has_dynamic_rate(self, sle):
++		if (
++			sle.recalculate_rate
++			or sle.voucher_type == "Stock Reconciliation"
++			or self.has_serial_or_batch(sle)
++			or flt(sle.qty_after_transaction) < 0
++			or self.has_landed_cost_based_on_pi(sle)
++		):
++			return True
++
++		if sle.voucher_type == "Stock Entry":
++			return sle.actual_qty > 0 and is_repack_entry(sle.voucher_no)
++
++		if sle.voucher_type in RETURN_AND_TRANSFER_VOUCHER_TYPES:
++			if frappe.get_cached_value(sle.voucher_type, sle.voucher_no, "is_return"):
++				return True
++
++			if sle.voucher_type in ("Purchase Receipt", "Purchase Invoice") and is_internal_transfer(sle):
++				return True
++
++		return False
++
+ 	def sort_sles(self, sles):
+ 		return sorted(
+ 			sles,
+diff --git a/erpnext/stock/tests/repost_early_exit_benchmark.py b/erpnext/stock/tests/repost_early_exit_benchmark.py
+new file mode 100644
+index 0000000..e58bb9e
+--- /dev/null
++++ b/erpnext/stock/tests/repost_early_exit_benchmark.py
+@@ -0,0 +1,62 @@
++"""Compare a full repost with the early exit on the Milk / Milk Powder scenario.
++
++Run on a test site:
++
++    bench --site <site> execute erpnext.stock.tests.repost_early_exit_benchmark.run --kwargs "{'extra_days': 100}"
++
++For each mode it builds the task scenario plus `extra_days` days of normal Milk entries after
++the manufacture entry, corrects the 10 Jan receipt from 60 to 80 with a Landed Cost Voucher,
++and prints how many later stock ledger entries were written and how long the submit took.
++Everything is rolled back at the end, so the site is left as it was.
++"""
++
++import time
++
++import frappe
++
++from erpnext.stock.tests.test_repost_early_exit import (
++	correct_rate_with_landed_cost,
++	get_context,
++	ledger_values,
++	make_milk_scenario,
++)
++
++
++def run(extra_days=100):
++	extra_days = int(extra_days)
++	pending = frappe.db.exists(
++		"Repost Item Valuation", {"docstatus": 1, "status": ("in", ("Queued", "In Progress", "Failed"))}
++	)
++	if pending:
++		print("Note: other reposts are queued or failed on this site, so early exit stays off.")
++
++	# in_test makes the repost run right away when the Landed Cost Voucher is submitted
++	# and stops the repost from committing, so everything can be rolled back.
++	frappe.flags.in_test = True
++	try:
++		ctx = get_context()
++		results = []
++		for label, disabled in (("Full repost (today)", True), ("Early exit (patch)", False)):
++			frappe.flags.disable_repost_early_exit = disabled
++			data = make_milk_scenario(ctx, extra_days=extra_days)
++
++			started = time.perf_counter()
++			run = correct_rate_with_landed_cost(ctx, data.pr_10, 1000)
++			seconds = time.perf_counter() - started
++
++			results.append((label, run, seconds, ledger_values(data.milk), ledger_values(data.powder)))
++
++		print()
++		print(f"Later Milk entries after the manufacture entry: {extra_days * 2}")
++		print(f"{'Mode':<24}{'Recalculated':>14}{'Skipped':>10}{'Seconds':>10}")
++		for label, run, seconds, *_ in results:
++			print(f"{label:<24}{run.processed:>14}{run.skipped:>10}{seconds:>10.2f}")
++
++		same = results[0][3] == results[1][3] and results[0][4] == results[1][4]
++		print(f"Both ledgers identical: {'yes' if same else 'NO'}")
++		if results[1][1].pending_reposts:
++			print(f"Early exit was off because of: {', '.join(results[1][1].pending_reposts)}")
++	finally:
++		frappe.flags.disable_repost_early_exit = False
++		frappe.flags.in_test = False
++		frappe.db.rollback()
+diff --git a/erpnext/stock/tests/test_repost_early_exit.py b/erpnext/stock/tests/test_repost_early_exit.py
+new file mode 100644
+index 0000000..ca58e09
+--- /dev/null
++++ b/erpnext/stock/tests/test_repost_early_exit.py
+@@ -0,0 +1,415 @@
++# Tests for the early exit in update_entries_after (erpnext/stock/stock_ledger.py).
++#
++# The scenario is the Milk / Milk Powder task:
++#   01 Jan  opening       Milk +100 @ 50
++#   10 Jan  PR            Milk  +50 @ 60   (later corrected to 80 with a Landed Cost Voucher)
++#   15 Jan  DN            Milk  -80
++#   20 Jan  PR            Milk  +50 @ 60
++#   21 Jan  Manufacture   Milk -100 -> Milk Powder +10
++#   25 Jan  DN            Milk Powder -10
++#
++# The tests create their own items, supplier and customer in the default company,
++# so they do not need the _Test records of ERPNext.
++
++import json
++
++import frappe
++from frappe.tests.utils import FrappeTestCase
++from frappe.utils import add_days, flt, getdate
++
++import erpnext
++from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
++
++POSTING_TIME = "10:00:00"
++SLE_FIELDS = (
++	"voucher_type",
++	"voucher_no",
++	"actual_qty",
++	"qty_after_transaction",
++	"incoming_rate",
++	"valuation_rate",
++	"stock_value",
++	"stock_value_difference",
++	"stock_queue",
++)
++
++
++class TestRepostEarlyExit(FrappeTestCase):
++	@classmethod
++	def setUpClass(cls):
++		super().setUpClass()
++		cls.ctx = get_context()
++
++	def tearDown(self):
++		frappe.flags.disable_repost_early_exit = False
++
++	def test_task_scenario_values_after_rate_change(self):
++		data = make_milk_scenario(self.ctx)
++		correct_rate_with_landed_cost(self.ctx, data.pr_10, 50 * 20)  # 60 -> 80
++
++		pr_10 = get_sle(data.pr_10.name, data.milk)
++		self.assertEqual(flt(pr_10.incoming_rate), 80)
++		self.assertEqual(flt(pr_10.stock_value), 9000)
++
++		# 15 Jan: cost stays 4000 (FIFO takes the opening layer @ 50), balance changes
++		dn_15 = get_sle(data.dn_15.name, data.milk)
++		self.assertEqual(flt(dn_15.stock_value_difference), -4000)
++		self.assertEqual(flt(dn_15.stock_value), 5000)
++
++		self.assertEqual(flt(get_sle(data.pr_20.name, data.milk).stock_value), 8000)
++
++		# 21 Jan: 20 @ 50 + 50 @ 80 + 30 @ 60 = 6800
++		milk_out = get_sle(data.mfg_21.name, data.milk)
++		self.assertEqual(flt(milk_out.stock_value_difference), -6800)
++		self.assertEqual(flt(milk_out.stock_value), 1200)
++
++		powder_in = get_sle(data.mfg_21.name, data.powder)
++		self.assertEqual(flt(powder_in.incoming_rate), 680)
++
++		self.assertEqual(flt(get_sle(data.dn_25.name, data.powder).stock_value_difference), -6800)
++
++	def test_early_exit_gives_same_ledger_as_full_repost(self):
++		self.skip_if_other_reposts_pending()
++
++		frappe.flags.disable_repost_early_exit = True
++		full = make_milk_scenario(self.ctx, extra_days=20)
++		full_run = correct_rate_with_landed_cost(self.ctx, full.pr_10, 1000)
++
++		frappe.flags.disable_repost_early_exit = False
++		early = make_milk_scenario(self.ctx, extra_days=20)
++		early_run = correct_rate_with_landed_cost(self.ctx, early.pr_10, 1000)
++
++		self.assertEqual(ledger_values(full.milk), ledger_values(early.milk))
++		self.assertEqual(ledger_values(full.powder), ledger_values(early.powder))
++
++		# 20 receipts and 20 deliveries of Milk come after the manufacture entry. They are skipped,
++		# except receipts when their rate can come from a Purchase Invoice (Buying Settings).
++		expected_skipped = 20 if landed_cost_based_on_purchase_invoice() else 40
++		trace = "\n".join(f"  {row}" for row in early_run.trace)
++		message = (
++			f"full repost: processed {full_run.processed}, skipped {full_run.skipped}\n"
++			f"early exit: processed {early_run.processed}, skipped {early_run.skipped}, "
++			f"enabled {early_run.early_exit_enabled}, pending {early_run.pending_reposts}\n"
++			f"stored state -> recalculated state:\n{trace}"
++		)
++		self.assertFalse(full_run.early_exit_enabled, message)
++		self.assertTrue(early_run.early_exit_enabled, message)
++		self.assertEqual(full_run.skipped, 0, message)
++		self.assertEqual(early_run.skipped, expected_skipped, message)
++		self.assertEqual(full_run.processed - early_run.processed, expected_skipped, message)
++
++	def test_return_after_convergence_is_still_reposted(self):
++		"""A purchase return takes its rate from the receipt, so it must be recalculated
++		even after Milk has converged."""
++		self.skip_if_other_reposts_pending()
++
++		frappe.flags.disable_repost_early_exit = True
++		full = make_milk_scenario(self.ctx, extra_days=5)
++		make_purchase_return(full.pr_10, qty=5, posting_date="2026-01-23")
++		correct_rate_with_landed_cost(self.ctx, full.pr_10, 1000)
++
++		frappe.flags.disable_repost_early_exit = False
++		early = make_milk_scenario(self.ctx, extra_days=5)
++		make_purchase_return(early.pr_10, qty=5, posting_date="2026-01-23")
++		correct_rate_with_landed_cost(self.ctx, early.pr_10, 1000)
++
++		self.assertEqual(ledger_values(full.milk), ledger_values(early.milk))
++
++	def test_bin_matches_last_entry_after_early_exit(self):
++		self.skip_if_other_reposts_pending()
++
++		data = make_milk_scenario(self.ctx, extra_days=10)
++		correct_rate_with_landed_cost(self.ctx, data.pr_10, 1000)
++
++		last_sle = frappe.get_all(
++			"Stock Ledger Entry",
++			filters={"item_code": data.milk, "warehouse": self.ctx.warehouse, "is_cancelled": 0},
++			fields=["qty_after_transaction", "stock_value"],
++			order_by="posting_datetime desc, creation desc",
++			limit=1,
++		)[0]
++		bin_values = frappe.db.get_value(
++			"Bin",
++			{"item_code": data.milk, "warehouse": self.ctx.warehouse},
++			["actual_qty", "stock_value"],
++			as_dict=True,
++		)
++		self.assertEqual(flt(bin_values.actual_qty), flt(last_sle.qty_after_transaction))
++		self.assertEqual(flt(bin_values.stock_value), flt(last_sle.stock_value))
++
++	def skip_if_other_reposts_pending(self):
++		if frappe.db.exists(
++			"Repost Item Valuation",
++			{"docstatus": 1, "status": ("in", ("Queued", "In Progress", "Failed"))},
++		):
++			self.skipTest("Other reposts are pending or failed on this site, early exit stays off")
++
++
++# ---------------------------------------------------------------- helpers
++
++
++def get_context():
++	company = erpnext.get_default_company() or frappe.get_all("Company", pluck="name", limit=1)[0]
++	abbr = frappe.get_cached_value("Company", company, "abbr")
++	warehouse = frappe.db.get_value(
++		"Warehouse", {"company": company, "is_group": 0, "warehouse_name": "Stores"}
++	) or frappe.db.get_value("Warehouse", {"company": company, "is_group": 0})
++
++	return frappe._dict(
++		company=company,
++		abbr=abbr,
++		warehouse=warehouse,
++		supplier=get_or_make_party("Supplier", "Early Exit Test Supplier"),
++		customer=get_or_make_party("Customer", "Early Exit Test Customer"),
++	)
++
++
++def get_or_make_party(doctype, name):
++	if frappe.db.exists(doctype, name):
++		return name
++
++	doc = frappe.new_doc(doctype)
++	if doctype == "Supplier":
++		doc.supplier_name = name
++		doc.supplier_group = frappe.db.get_value("Supplier Group", {"is_group": 0})
++	else:
++		doc.customer_name = name
++		doc.customer_group = frappe.db.get_value("Customer Group", {"is_group": 0})
++		doc.territory = frappe.db.get_value("Territory", {"is_group": 0})
++	doc.insert(ignore_permissions=True)
++	return doc.name
++
++
++def make_test_item(prefix):
++	item_code = f"{prefix}-{frappe.generate_hash(length=6)}"
++	frappe.get_doc(
++		{
++			"doctype": "Item",
++			"item_code": item_code,
++			"item_name": item_code,
++			"item_group": frappe.db.get_value("Item Group", {"is_group": 0}),
++			"stock_uom": "Nos",
++			"is_stock_item": 1,
++			"include_item_in_manufacturing": 1,
++			"valuation_method": "FIFO",
++		}
++	).insert(ignore_permissions=True)
++	return item_code
++
++
++def make_milk_scenario(ctx, extra_days=0):
++	"""The task scenario. extra_days adds one receipt and one delivery of Milk per day after
++	the manufacture entry, to stand for the normal entries that come after a backdated change."""
++	milk = make_test_item("EE-Milk")
++	powder = make_test_item("EE-Milk-Powder")
++
++	make_stock_entry(
++		item_code=milk,
++		qty=100,
++		rate=50,
++		to_warehouse=ctx.warehouse,
++		company=ctx.company,
++		posting_date="2026-01-01",
++		posting_time=POSTING_TIME,
++	)
++	bom = make_bom(ctx, powder, milk)
++
++	data = frappe._dict(milk=milk, powder=powder)
++	data.pr_10 = make_purchase_receipt(ctx, milk, 50, 60, "2026-01-10")
++	data.dn_15 = make_delivery_note(ctx, milk, 80, "2026-01-15")
++	data.pr_20 = make_purchase_receipt(ctx, milk, 50, 60, "2026-01-20")
++	data.mfg_21 = make_manufacture_entry(ctx, bom, 10, "2026-01-21")
++	data.dn_25 = make_delivery_note(ctx, powder, 10, "2026-01-25")
++
++	for day in range(extra_days):
++		posting_date = add_days("2026-01-22", day)
++		make_purchase_receipt(ctx, milk, 10, 60, posting_date)
++		make_delivery_note(ctx, milk, 10, posting_date)
++
++	return data
++
++
++def make_bom(ctx, item, raw_material):
++	bom = frappe.get_doc(
++		{
++			"doctype": "BOM",
++			"item": item,
++			"company": ctx.company,
++			"quantity": 10,
++			"rm_cost_as_per": "Valuation Rate",
++			"items": [{"item_code": raw_material, "qty": 100}],
++		}
++	)
++	bom.insert(ignore_permissions=True)
++	bom.submit()
++	return bom.name
++
++
++def make_purchase_receipt(ctx, item_code, qty, rate, posting_date):
++	pr = frappe.get_doc(
++		{
++			"doctype": "Purchase Receipt",
++			"company": ctx.company,
++			"supplier": ctx.supplier,
++			"set_posting_time": 1,
++			"posting_date": posting_date,
++			"posting_time": POSTING_TIME,
++			"set_warehouse": ctx.warehouse,
++			"items": [{"item_code": item_code, "qty": qty, "rate": rate, "warehouse": ctx.warehouse}],
++		}
++	)
++	pr.insert(ignore_permissions=True)
++	pr.submit()
++	return pr
++
++
++def make_delivery_note(ctx, item_code, qty, posting_date):
++	dn = frappe.get_doc(
++		{
++			"doctype": "Delivery Note",
++			"company": ctx.company,
++			"customer": ctx.customer,
++			"set_posting_time": 1,
++			"posting_date": posting_date,
++			"posting_time": POSTING_TIME,
++			"set_warehouse": ctx.warehouse,
++			"items": [{"item_code": item_code, "qty": qty, "rate": 100, "warehouse": ctx.warehouse}],
++		}
++	)
++	dn.insert(ignore_permissions=True)
++	dn.submit()
++	return dn
++
++
++def make_manufacture_entry(ctx, bom, qty, posting_date):
++	se = frappe.new_doc("Stock Entry")
++	se.purpose = "Manufacture"
++	se.stock_entry_type = "Manufacture"
++	se.company = ctx.company
++	se.from_bom = 1
++	se.bom_no = bom
++	se.fg_completed_qty = qty
++	se.use_multi_level_bom = 0
++	se.from_warehouse = ctx.warehouse
++	se.to_warehouse = ctx.warehouse
++	se.set_posting_time = 1
++	se.posting_date = posting_date
++	se.posting_time = POSTING_TIME
++	se.get_items()
++	se.insert(ignore_permissions=True)
++	se.submit()
++	return se
++
++
++def make_purchase_return(pr, qty, posting_date):
++	from erpnext.controllers.sales_and_purchase_return import make_return_doc
++
++	ret = make_return_doc("Purchase Receipt", pr.name)
++	ret.set_posting_time = 1
++	ret.posting_date = posting_date
++	ret.posting_time = POSTING_TIME
++	ret.items[0].qty = -qty
++	ret.items[0].received_qty = -qty
++	ret.insert(ignore_permissions=True)
++	ret.submit()
++	return ret
++
++
++def correct_rate_with_landed_cost(ctx, pr, amount):
++	"""Correct the receipt's rate the way it is done in production: a Landed Cost Voucher.
++	Returns what the reposts did: entries processed and skipped, and why early exit was off."""
++	expense_account = frappe.get_cached_value(
++		"Company", ctx.company, "expenses_included_in_valuation"
++	) or f"Expenses Included In Valuation - {ctx.abbr}"
++
++	lcv = frappe.get_doc(
++		{
++			"doctype": "Landed Cost Voucher",
++			"company": ctx.company,
++			"distribute_charges_based_on": "Amount",
++			"purchase_receipts": [
++				{
++					"receipt_document_type": "Purchase Receipt",
++					"receipt_document": pr.name,
++					"supplier": pr.supplier,
++					"posting_date": pr.posting_date,
++					"grand_total": pr.base_grand_total,
++				}
++			],
++			"taxes": [
++				{
++					"description": "Rate correction",
++					"expense_account": expense_account,
++					"amount": amount,
++				}
++			],
++		}
++	)
++
++	frappe.flags.repost_early_exit_stats = []
++	try:
++		lcv.insert(ignore_permissions=True)
++		lcv.submit()  # queues a Repost Item Valuation; in tests it runs right away
++		if not frappe.flags.in_test:
++			run_pending_reposts_for(pr)
++		stats = frappe.flags.repost_early_exit_stats
++	finally:
++		frappe.flags.repost_early_exit_stats = None
++
++	return frappe._dict(
++		reposts=len(stats),
++		early_exit_enabled=bool(stats) and all(row.early_exit_enabled for row in stats),
++		processed=sum(row.processed for row in stats),
++		skipped=sum(row.skipped for row in stats),
++		pending_reposts=sorted({name for row in stats for name in row.pending_reposts}),
++		trace=[entry for row in stats for entry in row.trace],
++	)
++
++
++def landed_cost_based_on_purchase_invoice():
++	return bool(
++		frappe.db.get_single_value("Buying Settings", "set_landed_cost_based_on_purchase_invoice_rate")
++	)
++
++
++def run_pending_reposts_for(pr):
++	from erpnext.stock.doctype.repost_item_valuation.repost_item_valuation import repost
++
++	for name in frappe.get_all(
++		"Repost Item Valuation",
++		filters={"voucher_no": pr.name, "docstatus": 1, "status": "Queued"},
++		pluck="name",
++	):
++		repost(frappe.get_doc("Repost Item Valuation", name))
++
++
++def get_sle(voucher_no, item_code):
++	return frappe.get_all(
++		"Stock Ledger Entry",
++		filters={"voucher_no": voucher_no, "item_code": item_code, "is_cancelled": 0},
++		fields=list(SLE_FIELDS),
++		limit=1,
++	)[0]
++
++
++def ledger_values(item_code):
++	"""The ledger of an item, without voucher names, so two runs can be compared."""
++	rows = frappe.get_all(
++		"Stock Ledger Entry",
++		filters={"item_code": item_code, "is_cancelled": 0},
++		fields=["posting_date", *SLE_FIELDS],
++		order_by="posting_datetime asc, creation asc",
++	)
++	return [
++		(
++			getdate(row.posting_date),
++			row.voucher_type,
++			flt(row.actual_qty, 6),
++			flt(row.qty_after_transaction, 6),
++			flt(row.valuation_rate, 6),
++			flt(row.stock_value, 2),
++			flt(row.stock_value_difference, 2),
++			tuple((flt(qty, 6), flt(rate, 6)) for qty, rate in json.loads(row.stock_queue or "[]")),
++		)
++		for row in rows
++	]
